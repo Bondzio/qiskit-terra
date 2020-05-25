@@ -1,0 +1,1073 @@
+lassdef (AllowedSubclasses = {?matlab.io.text.TextImportOptions,?matlab.io.spreadsheet.SpreadsheetImportOptions}) ImportOptions < matlab.io.internal.mixin.HasPropertiesAsNVPairs...
+        & matlab.mixin.internal.Scalar ...
+        & matlab.io.internal.shared.MissingErrorRulesInputs
+    %
+    
+    % Copyright 2016-2018 The MathWorks, Inc.
+    
+    
+    properties (Dependent)
+        %SELECTEDVARIABLENAMES Names of variables of interest
+        %   By default, SelectedVariableNames is equal to VariableNames. It can be
+        %   set to any unique subset of the VariableNames to indicate which
+        %   variables should be imported.
+        %
+        %   See also matlab.io.spreadsheet.SpreadsheetImportOptions
+        SelectedVariableNames
+        
+        %VARIABLENAMES Names of variables
+        %   The names to use when importing variables. If empty, variable names
+        %   will be read from data, or generated as Var1, Var2, etc..
+        %
+        %   See also matlab.io.spreadsheet.SpreadsheetImportOptions
+        VariableNames
+        
+        %VARIABLEOPTIONS Options for each import variable
+        %   VariableOptions is an array of VariableImportOptions of the same size
+        %   as variable names. Each element of the array sets options for a
+        %   specific variable.
+        %
+        %   Example, setting an option for a variable by name:
+        %       opts = detectImportOptions('patients.xls')
+        %       opts = setvaropts(opts,'Gender','MissingRule','error');
+        %
+        %   See also matlab.io.spreadsheet.SpreadsheetImportOptions
+        %   matlab.io.spreadsheet.SpreadsheetImportOptions/setvaropts
+        %   matlab.io.spreadsheet.SpreadsheetImportOptions/getvaropts
+        %   matlab.io.VariableImportOptions
+        VariableOptions
+        
+        %VARIABLETYPES Output types of the variables
+        %   VariableTypes is a cell array of character vectors whose values
+        %   indicate the datatype of the variable.
+        %   The following types (and resulting import variables) are supported:
+        %   * char - a cell array of character vectors
+        %   * double - a double precision floating point number array
+        %   * single - a single precision floating point number array
+        %   * datetime - a datetime array
+        %   * duration - a duration array
+        %   * categorical - a categorical array
+        %   * int8 - an 8-bit integer array
+        %   * int16 - a 16-bit integer array
+        %   * int32 - a 32-bit integer array
+        %   * int64 - a 64-bit integer array
+        %   * uint8 - an unsigned 8-bit integer array
+        %   * uint16 - an unsigned 16-bit integer array
+        %   * uint32 - an unsigned 32-bit integer array
+        %   * uint64 - an unsigned 64-bit integer array
+        %   * logical - a logical array
+        %
+        %   See also matlab.io.spreadsheet.SpreadsheetImportOptions
+        %   matlab.io.VariableImportOptions
+        %   matlab.io.TextVariableImportOptions
+        %   matlab.io.NumericVariableImportOptions
+        %   matlab.io.DatetimeVariableImportOptions
+        %   matlab.io.DurationVariableImportOptions
+        %   matlab.io.CategoricalVariableImportOptions
+        VariableTypes
+    end
+    
+    properties (Access = private)
+        var_opts = matlab.io.TextVariableImportOptions('Name','Var1');
+        selected_vars = ':';
+        is_unbounded_selection = true;
+        using_generated_names = false;
+    end
+    
+    properties (Hidden)
+        %CREATEDBY Hidden variable to check for value of the
+        %   'EmptyColumnType' field to determine what type to use when
+        %   returning empty columns. For backward comptability purposes,
+        %   currently we are passing in char for detectImportOptions, and
+        %   double for readtable/datastore/spreadsheet.
+        EmptyColumnType char
+    end
+    
+    methods
+        function obj = set.VariableTypes(obj,types)
+            oldTypes = obj.VariableTypes;
+            try types = cellstr(types); catch
+                error(message('MATLAB:textio:textio:InvalidStringOrCellStringProperty','VariableTypes'));
+            end
+            if numel(types) ~= numel(oldTypes)
+                error(message('MATLAB:textio:io:ExpectedCellStrSize',numel(oldTypes)))
+            end
+            idx = find(~strcmp(oldTypes,types));
+            % Call the setType method of var_opts for only the types which need to
+            % change.
+            obj.var_opts = obj.var_opts.overrideType(idx,types(idx));
+        end
+        
+        function obj = set.VariableOptions(obj,rhs)
+            if ~isa(rhs,'matlab.io.VariableImportOptions') || (~isvector(rhs) && ~isempty(rhs))
+                error(message('MATLAB:textio:io:ExpectedVarImportOpts'))
+            end
+            % replace empty names with Var##
+            names = rhs.getNames;
+            nOld = numel(obj.VariableOptions); nNew = numel(rhs);
+            emptyIDX = find(strcmp(names,''));
+            names(emptyIDX) = cellstr("Var" + (emptyIDX));
+            names = matlab.lang.makeUniqueStrings(names);
+            obj.var_opts = setNames(rhs(:)',names);
+            if nOld ~= nNew
+                obj = updatePerVarSizes(obj,nNew);
+            end
+            if obj.is_unbounded_selection && ~isequal(obj.selected_vars,':')
+                obj.selected_vars = [obj.selected_vars nOld+1:nNew];
+            end
+        end
+        
+        function obj = set.SelectedVariableNames(obj,rhs)
+            if (iscell(rhs) && ~iscellstr(rhs)) %#ok<ISCLSTR>
+                error(message('MATLAB:textio:io:BadSelectionInput'));
+            else
+                rhs = matlab.io.internal.validators.validateCellStringInput(rhs,'Selected Variable Names');
+            end
+            if isnumeric(rhs)
+                n = numel(obj.var_opts);
+                if ~all(rhs >= 1 & rhs <= n) || ~all(floor(rhs)==rhs)
+                    error(message('MATLAB:textio:io:BadNumericSelection'));
+                end
+            elseif ischar(rhs) || iscell(rhs)
+                try rhs = cellstr(rhs);catch
+                    error(message('MATLAB:textio:textio:InvalidStringOrCellStringProperty','SelectedVariableNames'));
+                end
+                rhs = getNumericSelection(obj,rhs);
+            else
+                error(message('MATLAB:textio:io:BadSelectionInput'))
+            end
+            obj.selected_vars = unique(rhs,'stable');
+            obj.is_unbounded_selection = isequal(rhs,':');
+        end
+        
+        function val = get.VariableNames(obj)
+            val = {obj.var_opts.Name};
+        end
+        
+        function val = get.VariableTypes(obj)
+            val = {obj.var_opts.Type};
+        end
+        
+        function val = get.VariableOptions(obj)
+            val = obj.var_opts;
+        end
+        
+        function val = get.SelectedVariableNames(obj)
+            val = obj.VariableNames(:,obj.selected_vars);
+        end
+        
+        function obj = set.VariableNames(obj,rhs)
+            rhs = convertStringsToChars(rhs);
+            if ischar(rhs)
+                rhs = {rhs};
+            end
+            
+            if ~iscell(rhs) || ~all(cellfun(@isvarname,rhs))
+                error(message('MATLAB:textio:io:BadVariableNames'));
+            end
+            iscellofstrings = ~(iscellstr(rhs) || ischar(rhs) || isstring(rhs));
+            if iscellofstrings
+                error(message('MATLAB:makeUniqueStrings:InvalidInputStrings'));
+            end
+            
+            rhs = rhs(:)';
+            oldNames = getNames(obj.var_opts);
+            nOld = numel(oldNames);
+            nNew = numel(rhs);
+            obj.verifyMaxVarSize(nNew);
+            
+            if nNew == 0
+                obj.var_opts(:) = [];
+            elseif nOld == 0
+                rhs = matlab.lang.makeUniqueStrings(rhs,{},namelengthmax);
+                obj.var_opts(:,nNew) = matlab.io.TextVariableImportOptions();
+            else
+                if nOld < nNew % Adding new names
+                    % Make the new names unique, preserving the old names
+                    obj.var_opts(:,numel(rhs)) = matlab.io.TextVariableImportOptions();
+                    sameAsOldIdx = [strcmp(rhs(1:numel(oldNames)),oldNames), false(1,numel(rhs)-numel(oldNames))];
+                else
+                    obj.var_opts(:,1+numel(rhs):end) = [];
+                    sameAsOldIdx = strcmp(rhs,oldNames(1:numel(rhs)));
+                end
+                % want to change the new names if they match any of the old names
+                rhs = matlab.lang.makeUniqueStrings(rhs,~sameAsOldIdx);
+            end
+            
+            if nOld ~= nNew
+                obj = updatePerVarSizes(obj,nNew);
+                if obj.is_unbounded_selection && ~isequal(obj.selected_vars,':')
+                    obj.selected_vars = [obj.selected_vars nOld+1:nNew];
+                end
+                % any selected names out of range should be removed
+                if ~ischar(obj.selected_vars)
+                    obj.selected_vars(obj.selected_vars > nNew)=[];
+                end
+            end
+            obj.var_opts = setNames(obj.var_opts,rhs);
+        end
+        
+        function obj = set.NumVariables(obj,rhs)
+            % Expect a non-negative scalar integer
+            if ~isnumeric(rhs) || ~isscalar(rhs) || floor(rhs) ~= rhs || rhs < 0 || isinf(rhs)
+                error(message('MATLAB:textio:textio:ExpectedScalarInt'));
+            end
+            
+            obj.var_opts(rhs+1:end) = [];
+            if rhs > 0
+                obj.var_opts(end:rhs) = matlab.io.TextVariableImportOptions();
+                % Generate VarN names with string scalar expansion
+                obj.var_opts = setNames(obj.var_opts,"Var" + (1:rhs));
+            end
+        end
+    end
+    
+    methods (Abstract, Access = protected)
+        obj = updatePerVarSizes(obj,nNew);
+        addCustomPropertyGroups(opts,helper);
+        modifyCustomGroups(opts,helper);
+        verifyMaxVarSize(obj,n);
+    end
+    
+    methods % class functions
+        function opts = setvartype(opts,varargin)
+            %setvartype
+            %   OPTS = setvartype(OPTS,TYPE) set all variables to the
+            %          specified TYPE by name.
+            %
+            %   OPTS = setvartype(OPTS,NAMES,TYPE) set the variables to the
+            %          specified TYPE by name. NAMES can be a character vector or a
+            %          cell array of character vectors.
+            %
+            %   OPTS = setvartype(OPTS,INDEX,TYPE) set the variables to the
+            %          specified TYPE by index. INDEX must be a vector of positive integers with
+            %          values between 1 and the length of the VARIABLENAMES property of OPTS.
+            %
+            %          TYPE can be any numeric type, 'string, 'char',
+            %          'datetime', 'duration, 'categorical' or 'logical'.
+            %
+            %   See also
+            %   setvaropts, getvaropts, detectImportOptions
+            %   matlab.io.VariableImportOptions
+            
+            import matlab.io.internal.validators.validateCellStringInput;
+            
+            narginchk(2,3);
+            if nargout == 0
+                error(message('MATLAB:textio:io:NOLHS','setvartype','setvartype'))
+            end
+            v_opts = opts.var_opts;
+            if nargin == 2
+                % setvartype(OPTS,TYPE) syntax
+                selection = 1:numel(v_opts);
+                type = varargin{1};
+            elseif isnumeric(varargin{1})
+                selection = varargin{1};
+                type = varargin{2};
+            elseif islogical(varargin{1})
+                selection = find(varargin{1});
+                type = varargin{2};
+            else
+                selection = validateCellStringInput(convertStringsToChars(varargin{1}), 'SELECTION');
+                if iscell(selection) || ischar(selection)
+                    % Get the appropriate numeric indices and error for unknown variable names.
+                    selection = opts.getNumericSelection(selection);
+                end
+                type = convertStringsToChars(varargin{2});
+            end
+            % Convert to cellstr
+            try type = cellstr(type); catch
+                error(message('MATLAB:textio:textio:InvalidStringOrCellStringProperty','TYPES'));
+            end
+            
+            % Expand scalar
+            if isscalar(type)
+                type = repmat(type,size(selection));
+            elseif numel(type) ~= numel(selection)
+                error(message('MATLAB:textio:io:MismatchVarTypes'))
+            end
+            
+            % Set the underlying types
+            try
+                opts.var_opts = v_opts.overrideType(selection,type);
+            catch ME
+                throw(ME)
+            end
+        end
+        
+        function opts = setvaropts(opts,varargin)
+            %setvaropts
+            %   OPTS = setvaropts(OPTS,VARNAMES, ...) set the options of variables
+            %          by name. VARNAMES can be a character vector or a cell array of
+            %          character vectors containing variable names.
+            %
+            %   OPTS = setvaropts(OPTS,INDEX,...) set the options of variables by index. INDEX
+            %          must be a vector of positive integers with values between 1
+            %          and the length of the VARIABLENAMES property of OPTS.
+            %
+            %   OPTS = setvaropts(OPTS,...) set all variables to the options specified. NOTE: If
+            %          the VARIABLETYPES property of OPTS list different types for different
+            %          variables, only the options which are available for all types can be
+            %          specified. If all the VARIABLETYPES of OPTS are the same, then the type
+            %          specific options may be specified.
+            %
+            %   OPTS = setvaropts(___,OPTION1,VALUE1,...,OPTIONK,VALUEK) set the selected options
+            %          with the parameters OPTION1, ..., PARAMK, to VALUE1, ..., VALUEK respectively.
+            %          NOTE: If the selection of variables have different types, only the options
+            %          which are available for all types can be specified. If all the variable
+            %          types of the variables are the same, then the type specific options may be
+            %          specified.
+            %
+            %   Valid parameter names available for all variable types are:
+            %       FillValue          - A scalar value to fill missing or
+            %                            unconvertible data
+            %       TreatAsMissing     - Text which is used in a file to represent
+            %                            missing data, e.g. 'NA'
+            %       QuoteRule          - How to treat quoted text.
+            %       Prefixes           - Prefix characters to be removed
+            %                            from variable on import
+            %       Suffixes           - Suffix characters to be removed
+            %                            from variable on import
+            %
+            %   Numeric specific options:
+            %       ExponentCharacter  - Character which should be treated as exponents when
+            %                            converting text
+            %       DecimalSeparator   - Character used to separate the integer part of a
+            %                            number from the decimal part of the number
+            %       ThousandsSeparator - Character used to separate the thousands place
+            %                            digits
+            %       TrimNonNumeric     - Logical used to specify that all
+            %                            prefixes and suffixes must be removed
+            %
+            %   Text specific options:
+            %       WhitespaceRule     - How to treat whitespace surrounding text
+            %
+            %   Datetime specific options:
+            %     DatetimeFormat       - Output format of the datetime array.
+            %        InputFormat       - The format to use when importing
+            %                            text as dates
+            %     DatetimeLocale       - The locale to be used when importing text as
+            %                            dates
+            %
+            %   Duration specific options:
+            %     DurationFormat       - Output format of the duration array.
+            %        InputFormat       - The format to use when importing text as
+            %                            time
+            %     FieldSeparator       - The character used to separate
+            %                            fields in the duration text
+            %   DecimalSeparator       - Character used to separate the integer part of a
+            %                            number from the decimal part of
+            %                            the number; applies to the seconds
+            %                            field of the duration text
+            %
+            %   Categorical specific options:
+            %         Categories       - List of expected categories
+            %          Protected       - Whether the output array is protected
+            %            Ordinal       - Whether the output array is ordinal
+            %
+            %   Logical specific options:
+            %        TrueSymbols       - Text to be converted to the logical value
+            %                            true.
+            %       FalseSymbols       - Text to be converted to the logical value
+            %                            false.
+            %      CaseSensitive       - Whether or not to consider case when matching
+            %                            symbols
+            %
+            %   Note: Certain variable import options control how text data (either in
+            %   text files or spreadsheet files) are converted to their respective
+            %   types. Native spreadsheet types which are converted to MATLAB types do
+            %   not use these options. For example, dates in spreadsheet files are stored as a
+            %   number of days since January 1st 1900, thus the InputFormat will not be
+            %   considered. However, dates ealier than January 1st 1900 must be stored in
+            %   spreadsheet files as text, and thus be converted using the value of InputFormat.
+            %
+            %   See also
+            %   setvartype, getvaropts, detectImportOptions, matlab.io.VariableImportOptions
+            
+            % Check the inputs for evenly matched N-V paris.
+            
+            narginchk(2,inf);
+            if nargout == 0
+                error(message('MATLAB:textio:io:NOLHS','setvaropts','setvaropts'))
+            end
+            
+            func = matlab.io.internal.functions.FunctionStore.getFunctionByName('setvaropts');
+            opts = func.validateAndExecute(opts,varargin{:});
+        end
+        
+        function vopts = getvaropts(opts,selection)
+            %getvaropts get variable options by name or number
+            %   VOPTS = getvaropts(OPTS,NAMES) get the options for the variables
+            %           with specified names. NAMES can be a character vector or cell
+            %           array of character vectors.
+            %
+            %   VOPTS = getvaropts(OPTS,INDEX) get the options for the variables
+            %           in the specified index. INDEX must be a vector of positive integers with
+            %           values between 1 and the length of the VARIABLENAMES property of OPTS.
+            %
+            %   VOPTS = getvaropts(OPTS) get the options for ALL the variables
+            %
+            %   See also
+            %   setvaropts, setvartype, detectImportOptions, matlab.io.VariableImportOptions
+            
+            if ~exist('selection','var')
+                selection = ':';
+            end
+            selection = matlab.io.internal.validators.validateCellStringInput(selection, 'NAMES');
+            vopts = opts.var_opts(opts.fixSelection(selection));
+        end
+        
+    end
+    
+    methods (Access = private)
+        function idx = getNumericSelection(obj,selection)
+            selection = cellstr(selection);
+            if isscalar(selection) && strcmp(selection,':')
+                idx = 1:numel(obj.var_opts);
+            else
+                [~,idx] = ismember(selection,{obj.var_opts.Name});
+                if any(idx==0)
+                    error(message('MATLAB:textio:io:UnknownVarName',selection{find(idx==0,1)}));
+                end
+            end
+        end
+        
+        function selection = fixSelection(opts,selection)
+            if iscell(selection) || ischar(selection)
+                selection = opts.getNumericSelection(selection);
+            elseif isnumeric(selection)
+                if ~all(selection > 0 & isfinite(selection) & floor(selection)==selection & selection <= numel(opts.var_opts))
+                    error(message('MATLAB:textio:io:BadNumericSelection'));
+                end
+            else
+                error(message('MATLAB:textio:io:BadSelectionInput'));
+            end
+        end
+    end
+    methods (Static, Hidden)
+        function [filename,opts,rrn,rvn,args] = validateReadtableInputs(filename,opts,args)
+            persistent parser
+            filename = matlab.io.internal.validators.validateFileName(filename);
+            % Choose the first match from the list of valid file names.
+            filename = filename{1};
+            if ~isa(opts,'matlab.io.ImportOptions')
+                error(message('MATLAB:textio:io:OptsSecondArg'))
+            end
+            if isempty(parser)
+                parser = inputParser();
+                parser.FunctionName = 'readtable';
+                parser.KeepUnmatched = true;
+                parser.addParameter('ReadVariableNames',false,@(tf)validateLogical(tf,'ReadVariableNames'));
+                parser.addParameter('ReadRowNames',false,@(tf)validateLogical(tf,'ReadRowNames'));
+            end
+            [args{:}] = convertStringsToChars(args{:});
+            parser.parse(args{:});
+            params = parser.Results;
+            
+            rrn = params.ReadRowNames;
+            if rrn && ~opts.usingRowNames()
+                % User didn't define a rownamesColumn, but called readtable with ReadRowNames
+                opts = opts.setRowNames(true);
+            elseif ~rrn && ~any(strcmp('ReadRowNames',parser.UsingDefaults)) && opts.usingRowNames()
+                % User specified a RowNamesColumn, but asked readtable not to import it.
+                % set the RowNames back to default
+                opts = opts.setRowNames(false);
+            end
+            
+            rvn = params.ReadVariableNames;
+            
+        end
+    end
+    
+    methods (Hidden)
+        
+        function T  = readtable(filename,opts,varargin)
+            if ~isa(opts,'matlab.io.ImportOptions')
+                error(message('MATLAB:textio:io:OptsSecondArg','readtable'))
+            end
+            try
+                func = matlab.io.internal.functions.FunctionStore.getFunctionByName('readtableWithImportOptions');
+                T = func.validateAndExecute(filename,opts,varargin{:});
+            catch ME
+                throw(ME);
+            end
+        end
+        
+        function TT = readtimetable(filename,opts,varargin)
+            if ~isa(opts,'matlab.io.ImportOptions')
+                error(message('MATLAB:textio:io:OptsSecondArg','readtimetable'))
+            end
+            try
+                func = matlab.io.internal.functions.FunctionStore.getFunctionByName('readtimetableWithImportOptions');
+                TT = func.validateAndExecute(filename,opts,varargin{:});
+            catch ME
+                throw(ME);
+            end
+        end
+        
+        function A = readmatrix(filename,opts,varargin)
+            if ~isa(opts,'matlab.io.ImportOptions')
+                error(message('MATLAB:textio:io:OptsSecondArg','readmatrix'))
+            end
+            try
+                func = matlab.io.internal.functions.FunctionStore.getFunctionByName('readmatrixWithImportOptions');
+                A = func.validateAndExecute(filename,opts,varargin{:});
+            catch ME
+                throw(ME);
+            end
+        end
+        
+        function C = readcell(filename,opts,varargin)
+            if ~isa(opts,'matlab.io.ImportOptions')
+                error(message('MATLAB:textio:io:OptsSecondArg','readcell'))
+            end
+            try
+                func = matlab.io.internal.functions.FunctionStore.getFunctionByName('readcellWithImportOptions');
+                C = func.validateAndExecute(filename,opts,varargin{:});
+            catch ME
+                throw(ME);
+            end
+        end
+        
+        function varargout = readvars(filename,opts,varargin)
+            if ~isa(opts,'matlab.io.ImportOptions')
+                error(message('MATLAB:textio:io:OptsSecondArg','readvars'))
+            end
+            try
+                func = matlab.io.internal.functions.FunctionStore.getFunctionByName('readvarsWithImportOptions');
+                [varargout{1:nargout}] = func.validateAndExecute(filename,opts,varargin{:});
+            catch ME
+                throw(ME);
+            end
+        end
+        
+        function disp(opts)
+            import matlab.io.internal.cellArrayDisp;
+            name = inputname(1);
+            h = matlab.internal.datatypes.DisplayHelper(class(opts));
+            
+            opts.addCustomPropertyGroups(h);
+            
+            replacePropDisp(h,"VariableNames",cellArrayDisp(opts.VariableNames,false,''));
+            replacePropDisp(h,"VariableTypes",cellArrayDisp(opts.VariableTypes,false,''));
+            replacePropDisp(h,"SelectedVariableNames",cellArrayDisp(opts.SelectedVariableNames,false,''));
+            
+            if h.usingHotlinks()
+                setVarHelp = h.helpTextLink("setvaropts", class(opts) + "/setvaropts");
+                getVarHelp = h.helpTextLink("getvaropts", class(opts) + "/getvaropts");
+                setvartypeText = h.helpTextLink("setvartype", class(opts) + "/setvartype");
+                
+                replacePropDisp(h,"VariableOptions",...
+                    sprintf('Show all %d %s',numel(opts.VariableOptions),h.propDisplayLink(name,"VariableOptions")));
+            else
+                setVarHelp = "setvaropts";
+                getVarHelp = "getvaropts";
+                setvartypeText = "setvartype";
+            end
+            
+            appendPropDisp(h,"VariableOptions",...
+                sprintf("\n\tAccess VariableOptions sub-properties using %s/%s",setVarHelp,getVarHelp));
+            if h.usingHotlinks()
+                previewHelp = h.helpTextLink("preview","matlab.io.text.TextImportOptions/preview");
+            else
+                previewHelp = "preview";
+            end
+            
+            if isa(opts,'matlab.io.spreadsheet.SpreadsheetImportOptions')
+                dispProp = "VariableDescriptionsRange";
+            else
+                dispProp = "VariableDescriptionsLine";
+            end
+            appendPropDisp(h,dispProp,sprintf('\n\t%s %s',...
+                getString(message('MATLAB:textio:io:TablePreview')),previewHelp));
+            opts.modifyCustomGroups(h);
+            appendPropDisp(h,"Variable Import Properties",sprintf("Set types by name using " + setvartypeText));
+            h.printToScreen("opts",false);
+        end
+    end
+    
+    properties (Dependent, Access = {?matlab.io.internal.mixin.HasPropertiesAsNVPairs})
+        NumVariables
+    end
+    
+    methods (Hidden)
+        function opts = setUnboundedSelection(opts,isUnbounded)
+            opts.is_unbounded_selection = isUnbounded;
+        end
+        function tf = namesAreGenerated(opts)
+            tf = opts.using_generated_names;
+        end
+        function opts = useGeneratedNames(opts,rnc)
+            opts.using_generated_names = true;
+            idx = 1:numel(opts.var_opts);
+            names = compose('Var%d',idx);
+            if rnc > 0
+                names{end} = 'Row';
+                names([rnc rnc+1:end]) = names([end rnc:end-1]);
+            end
+            
+            opts.var_opts.setNames(names);
+        end
+    end
+end
+
+
+
+function validateLogical(tf,param)
+if ~islogical(tf) && ~isnumeric(tf) || ~isscalar(tf)
+    error(message('MATLAB:table:InvalidLogicalVal',param));
+end
+end
+% LocalWords:  IMPORTERRORRULE omitrow omitvar MISSINGRULE
+% LocalWords:  SELECTEDVARIABLENAMES VARIABLENAMES VARIABLEOPTIONS setvaropts
+% LocalWords:  getvaropts VARIABLETYPES XFD importoptions setvartype NOLHS
+% LocalWords:  paris nv newnames VOPTS
+
+
+
+
+
+classdef VarOptsInputs < matlab.io.internal.FunctionInterface ...
+        & matlab.io.internal.shared.TreatAsMissingInput ...
+        & matlab.io.internal.shared.CommonVarOpts
+    %VARIABLEOPTIONSINPUTS Summary of this class goes here
+    %   Detailed explanation goes here
+
+%   Copyright 2018 The MathWorks, Inc.
+    
+    properties (Access = private)
+        Name_ = '';
+    end
+    
+    properties (Parameter, Dependent)
+        %NAME
+        %   Name of the variable to be imported. Must be a valid identifier.
+        %
+        % See also matlab.io.VariableImportOptions
+        Name
+    end
+    
+    properties (Parameter)
+        %TYPE
+        %   The input type of the variable when imported.
+        %
+        % See also matlab.io.VariableImportOptions
+        Type
+        
+        %FILLVALUE
+        %   Used as a replacement value when ErrorRule = 'fill' or
+        %   MissingRule = 'fill'. The valid types depend on the value of TYPE.
+        %
+        % See also matlab.io.VariableImportOptions
+        %   matlab.io.spreadsheet.SpreadsheetImportOptions/MissingRule
+        %   matlab.io.spreadsheet.SpreadsheetImportOptions/ImportErrorRule
+        %   matlab.io.VariableImportOptions/Type
+        FillValue
+    end
+    % get/set functions
+    methods    
+        function obj = set.Name(obj,rhs)
+        rhs = convertCharsToStrings(rhs);
+        if ~(isstring(rhs) && isscalar(rhs))
+            error(message('MATLAB:textio:textio:InvalidStringProperty','Name'));
+        end
+        if ~isvarname(rhs)
+            error(message('MATLAB:table:VariableNameNotValidIdentifier',rhs));
+        end
+        obj.Name_ = char(rhs);
+        end
+        
+        function val = get.Name(opts)
+        val = opts.Name_;
+        end
+                
+        function obj = set.Type(obj,val)
+        obj.Type = setType(obj,val);
+        end
+        
+        function val = get.Type(obj)
+        val = getType(obj,obj.Type);
+        end
+        function obj = set.FillValue(obj,val)
+        obj.FillValue = setFillValue(obj,val);
+        end
+        
+        function val = get.FillValue(obj)
+        % Converts to the correct type
+        val = getFillValue(obj,obj.FillValue);
+        end
+    end
+    
+    methods (Hidden, Sealed)
+        function opts = setNames(opts,names)
+        % avoid validating names
+        if ~isempty(names)
+            ids = ~strcmp(names,{opts.Name_});
+            [opts(ids).Name_] = names{ids};
+        end
+        end
+        function names = getNames(opts)
+        % avoid validating names
+        names = {opts.Name_};
+        end
+    end
+    
+    methods (Abstract,Access = protected)
+        type = setType(obj,val);
+        type = getType(obj,val);
+        val = setFillValue(obj,val);
+        val = getFillValue(obj,val);
+    end
+    
+    methods (Static)
+        function validateFixedType(name,type,rhs)
+        import matlab.io.internal.supportedTypeNames
+        rhs = convertCharsToStrings(rhs);
+        if ~isstring(rhs) || ~any(strcmp(supportedTypeNames,rhs))
+            error(message('MATLAB:textio:io:NotDataType'));
+        end
+        newMsg = [getString(message('MATLAB:textio:io:StaticOptionsType',type)), ...
+            '\n\n',getString(message('MATLAB:textio:io:Setdatatype')), '\n', ...
+            getString(message('MATLAB:textio:io:SetvartypeSyntax',name,rhs))];
+        throw(MException('MATLAB:textio:io:StaticOptionsType',newMsg));
+        end
+    end
+end
+
+
+
+
+
+
+
+
+function varargout = unique(varargin)
+%UNIQUE Set unique.
+%   C = UNIQUE(A) for the array A returns the same values as in A but with 
+%   no repetitions. C will be sorted.    
+%  
+%   C = UNIQUE(A,'rows') for the matrix A returns the unique rows of A.
+%   The rows of the matrix C will be in sorted order.
+%  
+%   [C,IA,IC] = UNIQUE(A) also returns index vectors IA and IC such that
+%   C = A(IA) and A = C(IC).  
+%  
+%   [C,IA,IC] = UNIQUE(A,'rows') also returns index vectors IA and IC such
+%   that C = A(IA,:) and A = C(IC,:). 
+%  
+%   [C,IA,IC] = UNIQUE(A,OCCURRENCE) and
+%   [C,IA,IC] = UNIQUE(A,'rows',OCCURRENCE) specify which index is returned
+%   in IA in the case of repeated values (or rows) in A. The default value
+%   is OCCURRENCE = 'first', which returns the index of the first occurrence  
+%   of each repeated value (or row) in A, while OCCURRENCE = 'last' returns 
+%   the index of the last occurrence of each repeated value (or row) in A.
+%  
+%   [C,IA,IC] = UNIQUE(A,'stable') returns the values of C in the same order
+%   that they appear in A, while [C,IA,IC] = UNIQUE(A,'sorted') returns the
+%   values of C in sorted order. If A is a row vector, then C will be a row
+%   vector as well, otherwise C will be a column vector. IA and IC are
+%   column vectors. If there are repeated values in A, then IA returns the
+%   index of the first occurrence of each repeated value.
+% 
+%   [C,IA,IC] = UNIQUE(A,'rows','stable') returns the rows of C in the same
+%   order that they appear in A, while [C,IA,IC] = UNIQUE(A,'rows','sorted')
+%   returns the rows of C in sorted order.
+% 
+%   The behavior of UNIQUE has changed.  This includes:
+%     -	occurrence of indices in IA and IC switched from last to first
+%     -	IA and IC will always be column index vectors
+% 
+%   If this change in behavior has adversely affected your code, you may 
+%   preserve the previous behavior with:
+% 
+%        [C,IA,IC] = UNIQUE(A,'legacy')
+%        [C,IA,IC] = UNIQUE(A,'rows','legacy') 
+%        [C,IA,IC] = UNIQUE(A,OCCURRENCE,'legacy')
+%        [C,IA,IC] = UNIQUE(A,'rows',OCCURRENCE,'legacy')
+%
+%   Examples:
+%
+%       a = [9 9 9 9 9 9 8 8 8 8 7 7 7 6 6 6 5 5 4 2 1]
+%
+%       [c1,ia1,ic1] = unique(a)
+%       % returns
+%       c1 = [1 2 4 5 6 7 8 9]
+%       ia1 = [21 20 19 17 14 11 7 1]'
+%       ic1 = [8 8 8 8 8 8 7 7 7 7 6 6 6 5 5 5 4 4 3 2 1]'
+%
+%       [c2,ia2,ic2] = unique(a,'stable')
+%       % returns
+%       c2 = [9 8 7 6 5 4 2 1]
+%       ia2 = [1 7 11 14 17 19 20 21]'
+%       ic2 = [1 1 1 1 1 1 2 2 2 2 3 3 3 4 4 4 5 5 6 7 8]'
+%
+%       c = unique([1 NaN NaN 2])
+%       % NaNs compare as not equal, so this returns
+%       c = [1 2 NaN NaN]
+%
+%   Class support for input A:
+%      - logical, char, all numeric classes
+%      - cell arrays of strings
+%      -- 'rows' option is not supported for cell arrays
+%      - objects with methods SORT (SORTROWS for the 'rows' option) and NE
+%      -- including heterogeneous arrays
+%
+%   See also UNION, INTERSECT, SETDIFF, SETXOR, ISMEMBER, SORT, SORTROWS.
+
+%   Copyright 1984-2018 The MathWorks, Inc.
+
+% Determine the number of outputs requested.
+if nargout == 0
+    nlhs = 1;
+else
+    nlhs = nargout;
+end
+
+narginchk(1,4);
+if ~iscellstr(varargin{1})
+    error(message('MATLAB:UNIQUE:InputClass'));
+end
+nrhs = nargin;
+if nrhs == 1
+    [varargout{1:nlhs}] = celluniqueR2012a(varargin{:});
+else
+    % acceptable combinations, with optional inputs denoted in []
+    % unique(A, ['rows'], ['first'/'last'], ['legacy'/'R2012a']),
+    % where the position of 'rows' and 'first'/'last' may be reversed
+    % unique(A, ['rows'], ['sorted'/'stable']),
+    % where the position of 'rows' and 'sorted'/'stable' may be reversed
+    nflagvals = 7;
+    flagvals = ["rows" "first" "last" "sorted" "stable" "legacy" "R2012a"];
+    % When a flag is found, note the index into varargin where it was found
+    flaginds = zeros(1,nflagvals);
+    for i = 2:nrhs
+        flag = varargin{i};
+        foundflag = matlab.internal.math.partialMatchString(flag,flagvals);
+        if ~any(foundflag)
+            if ischar(flag)
+                error(message('MATLAB:UNIQUE:UnknownFlag',flag));
+            else
+                error(message('MATLAB:UNIQUE:UnknownInput'));
+            end
+        end
+        % Only 1 occurrence of each allowed flag value
+        if flaginds(foundflag)
+            error(message('MATLAB:UNIQUE:RepeatedFlag',flag));
+        end
+        flaginds(foundflag) = i;
+    end
+    
+    % Only 1 of each of the paired flags
+    if flaginds(2) && flaginds(3)
+        error(message('MATLAB:UNIQUE:OccurrenceConflict'))
+    end
+    if flaginds(4) && flaginds(5)
+        error(message('MATLAB:UNIQUE:SetOrderConflict'))
+    end
+    if flaginds(6) && flaginds(7)
+        error(message('MATLAB:UNIQUE:BehaviorConflict'))
+    end
+    % 'legacy' and 'R2012a' flags must be trailing
+    if flaginds(6) && flaginds(6)~=nrhs
+        error(message('MATLAB:UNIQUE:LegacyTrailing'))
+    end
+    if flaginds(7) && flaginds(7)~=nrhs
+        error(message('MATLAB:UNIQUE:R2012aTrailing'))
+    end
+    
+    if flaginds(4) || flaginds(5) % 'stable'/'sorted' specified
+        if flaginds(2) || flaginds(3) % does not combine with 'first'/'last'
+            error(message('MATLAB:UNIQUE:SetOrderOccurrence'))
+        end
+        if flaginds(6) || flaginds(7) % does not combine with 'legacy'/'R2012a'
+            error(message('MATLAB:UNIQUE:SetOrderBehavior'))
+        end
+        [varargout{1:nlhs}] = celluniqueR2012a(varargin{1},logical(flaginds(1:5)));
+    elseif flaginds(7) % trailing 'R2012a' specified
+        [varargout{1:nlhs}] = celluniqueR2012a(varargin{1},logical(flaginds(1:5)));
+    elseif flaginds(6) % trailing 'legacy' specified
+        [varargout{1:nlhs}] = celluniquelegacy(varargin{1},logical(flaginds(1:3)));
+    else % 'R2012a' (default behavior, to be changed to 'R2012a' in future)
+        [varargout{1:nlhs}] = celluniqueR2012a(varargin{1},logical(flaginds(1:5)));
+    end
+end
+end
+
+function [b,ndx,pos] = celluniquelegacy(a,options)
+% 'legacy' flag implementation
+
+%flagvals = {'rows' 'first' 'last'};
+if nargin == 1
+    order = 'last';
+else
+    if options(1) > 0
+        warning(message('MATLAB:UNIQUE:RowsFlagIgnored'));
+    end
+    if options(2) > 0
+        order = 'first';
+    else % if options(3) > 0 || sum(options(2:3) == 0)
+        order = 'last';
+    end
+end
+
+% check is input is a column vector with each element a single row text array.
+if any(cellfun('size',a,1)>1)
+   error(message('MATLAB:UNIQUE:NotARowVector'))
+end
+
+% initialise output variables
+if isempty(a)
+    if ~any(size(a))
+        b = {};
+        ndx = [];
+        pos = [];
+    else
+        b = cell(0, 1);
+        ndx = zeros(0,1);
+        pos = ndx;
+    end
+    return
+end
+
+isrow = ndims(a)==2 && size(a,1)==1 && size(a,2) ~= 1;
+
+% first sort the rows of the cell array.
+[b,ndx] = sort(a);
+
+d = ~strcmp(b(1:end-1),b(2:end));
+
+if order(1) == 'l' % 'last'
+    d = localcat(d, true, isrow);
+else % order == 'first'
+    d = localcat(true, d, isrow);      % First element is always a member of unique list.
+end
+
+% extract unique elements
+b = b(d);
+
+if order(1) == 'l' % 'last'
+   % create position index vector
+   pos = cumsum(localcat(1,d(1:end-1), isrow));
+else % order == 'first'
+   % create position index vector
+   pos = cumsum(d);
+end
+% Re-reference POS to indexing of SORT.
+pos(ndx) = pos;
+
+% create index vector
+ndx = ndx(d);
+end
+
+function value = localcat(a,b,isrow)
+
+if (isrow)
+    value = [a,b];
+else
+    value = [a;b];
+end
+end
+
+function [c,indA,indC] = celluniqueR2012a(a,options)
+% 'R2012a' flag implementation
+
+% flagvals = {'rows' 'first' 'last' 'sorted' 'stable'};
+if nargin == 1
+    order = 'sorted';
+else
+    if options(1) > 0
+        warning(message('MATLAB:UNIQUE:RowsFlagIgnored'));     % 'rows' flag ignored for cellstrs.
+    end
+    if options(5) > 0
+        order = 'stable';
+    elseif options(3) > 0
+        order = 'last';
+    else % if options(4) > 0 || options(2) || sum(options(2:5) == 0)
+        order = 'sorted';   %'first' and 'sorted' do the same thing
+    end
+end
+
+% check if input is an array with each element a single row text array.
+if any(cellfun('size',a(:),1)>1)
+    error(message('MATLAB:UNIQUE:NotARowVector'));
+end
+
+% Determine if A is a row vector and the number of elements of A.
+rowvec = isrow(a);
+numelA = numel(a);
+
+a = a(:);
+
+% Sort A and get indices.
+[sortA,indSortA] = sort(a);
+
+
+% groupsSortA indicates the location of non-matching entries.
+groupsSortA = ~strcmp(sortA(1:end-1),sortA(2:end));
+groupsSortA = groupsSortA(:);
+
+if ~isempty(a)
+    if strcmp(order, 'last') 
+        groupsSortA = [groupsSortA; true];      % Final element is always a member of unique list.
+    else % strcmp(order, 'sorted') || strcmp(order, 'stable')
+        groupsSortA = [true;groupsSortA];       % First element is always a member of unique list.
+    end
+end
+
+% Extract unique elements
+if strcmp(order, 'stable') 
+    invIndSortA = indSortA;
+    invIndSortA(invIndSortA) = 1:numelA;    % Find inverse permutation.
+    logIndA = groupsSortA(invIndSortA);     % Create new logical by indexing into groupsSortA.
+    c = a(logIndA);                         % Create unique list by indexing into unsorted a.
+else
+    c = sortA(groupsSortA);                 % Create unique list by indexing into sorted list.
+end
+
+% Find indA.
+if nargout > 1
+    if strcmp(order, 'stable')
+        indA = find(logIndA);               % Find the indices of the unsorted logical.
+    else
+        indA = indSortA(groupsSortA);       % Find the indices of the sorted logical.
+    end
+end
+
+% Find indC.
+if nargout == 3
+    if isempty(a)
+        indC = zeros(0,1);
+    else
+        switch order
+            case 'last'
+                indC = cumsum([1;groupsSortA(1:end-1)]);        % Lists position, starting at 1.
+                indC(indSortA) = indC;                          % Re-reference indC to indexing of sortA.
+            case 'sorted'
+                indC = cumsum(groupsSortA);                     % Lists position, starting at 1.
+                indC(indSortA) = indC;                          % Re-reference indC to indexing of sortA.
+            otherwise % 'stable'
+                [~,indSortC] = sort(c);                         % Sort C to get index.
+                
+                lengthGroupsSortA = diff(find([groupsSortA; true]));    % Determine how many of each of the above indices there are in IC.
+                
+                diffIndSortC = diff(indSortC);                          % Get the correct amount of each index.
+                diffIndSortC = [indSortC(1); diffIndSortC];
+                
+                indLengthGroupsSortA = cumsum([1; lengthGroupsSortA]);
+                indLengthGroupsSortA(end) = [];
+                
+                indCOrderedBySortA(indLengthGroupsSortA,1) = diffIndSortC;        % Since indCOrderedBySortA is not already established as a column,
+                if sum(lengthGroupsSortA) ~= length(indCOrderedBySortA);
+                    indCOrderedBySortA(sum(lengthGroupsSortA),1) = 0;
+                end
+                
+                indCOrderedBySortA = cumsum(indCOrderedBySortA);
+                indC = indCOrderedBySortA(invIndSortA);                 % Reorder the list of indices to the unsorted order.
+        end
+    end
+end
+
+if rowvec
+    c = c.';
+end
+end
